@@ -26,12 +26,14 @@ import java.util.Random;
 
 import com.google.common.primitives.Ints;
 
+import net.minecraft.block.material.MapColor;
 import net.minecraft.block.material.Material;
 import net.minecraft.block.state.IBlockState;
 import net.minecraft.util.EnumFacing;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.IBlockAccess;
 import net.minecraft.world.World;
+import net.minecraftforge.common.util.Constants;
 import net.minecraftforge.event.ForgeEventFactory;
 
 import javax.annotation.Nonnull;
@@ -55,10 +57,15 @@ public class BlockFluidClassic extends BlockFluidBase
 
     protected FluidStack stack;
 
+    public BlockFluidClassic(Fluid fluid, Material material, MapColor mapColor)
+    {
+        super(fluid, material, mapColor);
+        stack = new FluidStack(fluid, Fluid.BUCKET_VOLUME);
+    }
+
     public BlockFluidClassic(Fluid fluid, Material material)
     {
-        super(fluid, material);
-        stack = new FluidStack(fluid, Fluid.BUCKET_VOLUME);
+        this(fluid, material, material.getMaterialMapColor());
     }
 
     public BlockFluidClassic setFluidStack(FluidStack stack)
@@ -126,12 +133,8 @@ public class BlockFluidClassic extends BlockFluidBase
             {
                 expQuanta = quantaPerBlock;
             }
-            // unobstructed flow from 'above'
-            else if (world.getBlockState(pos.down(densityDir)).getBlock() == this
-                    || hasDownhillFlow(world, pos, EnumFacing.EAST)
-                    || hasDownhillFlow(world, pos, EnumFacing.WEST)
-                    || hasDownhillFlow(world, pos, EnumFacing.NORTH)
-                    || hasDownhillFlow(world, pos, EnumFacing.SOUTH))
+            // vertical flow into block
+            else if (hasVerticalFlow(world, pos))
             {
                 expQuanta = quantaPerBlock - 1;
             }
@@ -156,7 +159,7 @@ public class BlockFluidClassic extends BlockFluidBase
                 }
                 else
                 {
-                    world.setBlockState(pos, state.withProperty(LEVEL, quantaPerBlock - expQuanta), 2);
+                    world.setBlockState(pos, state.withProperty(LEVEL, quantaPerBlock - expQuanta), Constants.BlockFlags.SEND_TO_CLIENTS);
                     world.scheduleUpdate(pos, this, tickRate);
                     world.notifyNeighborsOfStateChange(pos, this, false);
                 }
@@ -179,7 +182,7 @@ public class BlockFluidClassic extends BlockFluidBase
 
         if (isSourceBlock(world, pos) || !isFlowingVertically(world, pos))
         {
-            if (world.getBlockState(pos.down(densityDir)).getBlock() == this)
+            if (hasVerticalFlow(world, pos))
             {
                 flowMeta = 1;
             }
@@ -278,7 +281,7 @@ public class BlockFluidClassic extends BlockFluidBase
         if (meta < 0) return;
         if (displaceIfPossible(world, pos))
         {
-            world.setBlockState(pos, this.getDefaultState().withProperty(LEVEL, meta), 3);
+            world.setBlockState(pos, this.getDefaultState().withProperty(LEVEL, meta));
         }
     }
 
@@ -289,7 +292,7 @@ public class BlockFluidClassic extends BlockFluidBase
 
     protected int getLargerQuanta(IBlockAccess world, BlockPos pos, int compare)
     {
-        int quantaRemaining = getQuantaValue(world, pos);
+        int quantaRemaining = getEffectiveQuanta(world, pos);
         if (quantaRemaining <= 0)
         {
             return compare;
@@ -308,7 +311,7 @@ public class BlockFluidClassic extends BlockFluidBase
         if (doPlace)
         {
             FluidUtil.destroyBlockOnFluidPlacement(world, pos);
-            world.setBlockState(pos, this.getDefaultState(), 11);
+            world.setBlockState(pos, this.getDefaultState(), Constants.BlockFlags.DEFAULT_AND_RERENDER);
         }
         return Fluid.BUCKET_VOLUME;
     }

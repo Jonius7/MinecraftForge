@@ -21,6 +21,8 @@ package net.minecraftforge.common.crafting;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -35,6 +37,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
@@ -43,7 +46,6 @@ import javax.annotation.Nonnull;
 
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
-import org.apache.logging.log4j.Level;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -86,10 +88,10 @@ import net.minecraftforge.registries.RegistryManager;
 public class CraftingHelper {
 
     private static final boolean DEBUG_LOAD_MINECRAFT = false;
-    private static Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
-    private static Map<ResourceLocation, IConditionFactory> conditions = Maps.newHashMap();
-    private static Map<ResourceLocation, IIngredientFactory> ingredients = Maps.newHashMap();
-    private static Map<ResourceLocation, IRecipeFactory> recipes = Maps.newHashMap();
+    public static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
+    private static final Map<ResourceLocation, IConditionFactory> conditions = Maps.newHashMap();
+    private static final Map<ResourceLocation, IIngredientFactory> ingredients = Maps.newHashMap();
+    private static final Map<ResourceLocation, IRecipeFactory> recipes = Maps.newHashMap();
 
     static {
         init();
@@ -224,7 +226,7 @@ public class CraftingHelper {
                 if(element.isJsonObject())
                     nbt = JsonToNBT.getTagFromJson(GSON.toJson(element));
                 else
-                    nbt = JsonToNBT.getTagFromJson(element.getAsString());
+                    nbt = JsonToNBT.getTagFromJson(JsonUtils.getString(element, "nbt"));
 
                 NBTTagCompound tmp = new NBTTagCompound();
                 if (nbt.hasKey("ForgeCaps"))
@@ -367,6 +369,11 @@ public class CraftingHelper {
         return ret;
     }
 
+    public static boolean processConditions(JsonObject json, String memberName, JsonContext context)
+    {
+        return !json.has(memberName) || processConditions(JsonUtils.getJsonArray(json, memberName), context);
+    }
+
     public static boolean processConditions(JsonArray conditions, JsonContext context)
     {
         for (int x = 0; x < conditions.size(); x++)
@@ -414,7 +421,7 @@ public class CraftingHelper {
     // INTERNAL
     //=======================================================
 
-    private static void init()
+    public static void init()
     {
         conditions.clear();
         ingredients.clear();
@@ -550,35 +557,41 @@ public class CraftingHelper {
         register(new ResourceLocation(name), fac);
     }
 
-    static void loadFactories(JsonObject json, JsonContext context)
+    public static final class FactoryLoader<T>
     {
-        if (json.has("ingredients"))
-        {
-            for (Entry<String, JsonElement> entry : JsonUtils.getJsonObject(json, "ingredients").entrySet())
-            {
-                ResourceLocation key = new ResourceLocation(context.getModId(), entry.getKey());
-                String clsName = JsonUtils.getString(entry.getValue(), "ingredients[" + entry.getValue() + "]");
-                register(key, getClassInstance(clsName, IIngredientFactory.class));
-            }
-        }
+        final String name;
+        final Class<T> type;
+        final BiConsumer<ResourceLocation, T> consumer;
 
-        if (json.has("recipes"))
+        FactoryLoader(String name, Class<T> type, BiConsumer<ResourceLocation, T> consumer)
         {
-            for (Entry<String, JsonElement> entry : JsonUtils.getJsonObject(json, "recipes").entrySet())
-            {
-                ResourceLocation key = new ResourceLocation(context.getModId(), entry.getKey());
-                String clsName = JsonUtils.getString(entry.getValue(), "recipes[" + entry.getValue() + "]");
-                register(key, getClassInstance(clsName, IRecipeFactory.class));
-            }
+            this.name = name;
+            this.type = type;
+            this.consumer = consumer;
         }
+    }
 
-        if (json.has("conditions"))
+    public static final FactoryLoader<IIngredientFactory> INGREDIENTS = new FactoryLoader<>("ingredients", IIngredientFactory.class, CraftingHelper::register);
+    public static final FactoryLoader<IRecipeFactory> RECIPES = new FactoryLoader<>("recipes", IRecipeFactory.class, CraftingHelper::register);
+    public static final FactoryLoader<IConditionFactory> CONDITIONS = new FactoryLoader<>("conditions", IConditionFactory.class, CraftingHelper::register);
+
+    private static void loadFactories(JsonObject json, JsonContext context, FactoryLoader... loaders)
+    {
+        for (FactoryLoader<?> loader : loaders)
         {
-            for (Entry<String, JsonElement> entry : JsonUtils.getJsonObject(json, "conditions").entrySet())
+            loadFactory(json, context, loader);
+        }
+    }
+
+    private static <T> void loadFactory(JsonObject json, JsonContext context, FactoryLoader<T> loader)
+    {
+        if (json.has(loader.name))
+        {
+            for (Entry<String, JsonElement> entry : JsonUtils.getJsonObject(json, loader.name).entrySet())
             {
                 ResourceLocation key = new ResourceLocation(context.getModId(), entry.getKey());
-                String clsName = JsonUtils.getString(entry.getValue(), "conditions[" + entry.getValue() + "]");
-                register(key, getClassInstance(clsName, IConditionFactory.class));
+                String clsName = JsonUtils.getString(entry.getValue(), loader.name + "[" + entry.getValue() + "]");
+                loader.consumer.accept(key, getClassInstance(clsName, loader.type));
             }
         }
     }
@@ -628,36 +641,43 @@ public class CraftingHelper {
 
     private static void loadFactories(ModContainer mod)
     {
+        loadFactories(mod, "assets/" + mod.getModId() + "/recipes", INGREDIENTS, RECIPES, CONDITIONS);
+    }
+
+    public static void loadFactories(ModContainer mod, String base, FactoryLoader... loaders)
+    {
         FileSystem fs = null;
-        BufferedReader reader = null;
         try
         {
-            JsonContext ctx = new JsonContext(mod.getModId());
             Path fPath = null;
+            JsonContext ctx = new JsonContext(mod.getModId());
+
             if (mod.getSource().isFile())
             {
                 fs = FileSystems.newFileSystem(mod.getSource().toPath(), null);
-                fPath = fs.getPath("/assets/" + ctx.getModId() + "/recipes/_factories.json");
+                fPath = fs.getPath("/" + base, "_factories.json");
             }
             else if (mod.getSource().isDirectory())
             {
-                fPath = mod.getSource().toPath().resolve("assets/" + ctx.getModId() + "/recipes/_factories.json");
+                fPath = mod.getSource().toPath().resolve(base).resolve("_factories.json");
             }
+
             if (fPath != null && Files.exists(fPath))
             {
-                reader = Files.newBufferedReader(fPath);
-                JsonObject json = JsonUtils.fromJson(GSON, reader, JsonObject.class);
-                loadFactories(json, ctx);
+                try (BufferedReader reader = Files.newBufferedReader(fPath))
+                {
+                    JsonObject json = JsonUtils.fromJson(GSON, reader, JsonObject.class);
+                    loadFactories(json, ctx, loaders);
+                }
             }
         }
-        catch (IOException e)
+        catch (JsonParseException | IOException e)
         {
-            e.printStackTrace();
+            FMLLog.log.error("Error loading _factories.json: ", e);
         }
         finally
         {
             IOUtils.closeQuietly(fs);
-            IOUtils.closeQuietly(reader);
         }
     }
 
@@ -671,21 +691,15 @@ public class CraftingHelper {
                 Path fPath = root.resolve("_constants.json");
                 if (fPath != null && Files.exists(fPath))
                 {
-                    BufferedReader reader = null;
-                    try
+                    try(BufferedReader reader = Files.newBufferedReader(fPath))
                     {
-                        reader = Files.newBufferedReader(fPath);
                         JsonObject[] json = JsonUtils.fromJson(GSON, reader, JsonObject[].class);
                         ctx.loadConstants(json);
                     }
-                    catch (IOException e)
+                    catch (JsonParseException | IOException e)
                     {
                         FMLLog.log.error("Error loading _constants.json: ", e);
                         return false;
-                    }
-                    finally
-                    {
-                        IOUtils.closeQuietly(reader);
                     }
                 }
                 return true;
@@ -701,12 +715,10 @@ public class CraftingHelper {
                 String name = FilenameUtils.removeExtension(relative).replaceAll("\\\\", "/");
                 ResourceLocation key = new ResourceLocation(ctx.getModId(), name);
 
-                BufferedReader reader = null;
-                try
+                try(BufferedReader reader = Files.newBufferedReader(file))
                 {
-                    reader = Files.newBufferedReader(file);
                     JsonObject json = JsonUtils.fromJson(GSON, reader, JsonObject.class);
-                    if (json.has("conditions") && !CraftingHelper.processConditions(JsonUtils.getJsonArray(json, "conditions"), ctx))
+                    if (!processConditions(json, "conditions", ctx))
                         return true;
                     IRecipe recipe = CraftingHelper.getRecipe(json, ctx);
                     ForgeRegistries.RECIPES.register(recipe.setRegistryName(key));
@@ -720,10 +732,6 @@ public class CraftingHelper {
                 {
                     FMLLog.log.error("Couldn't read recipe {} from {}", key, file, e);
                     return false;
-                }
-                finally
-                {
-                    IOUtils.closeQuietly(reader);
                 }
                 return true;
             },
@@ -749,31 +757,36 @@ public class CraftingHelper {
         return findFiles(mod, base, preprocessor, processor, defaultUnfoundRoot, false);
     }
 
-    public static boolean findFiles(ModContainer mod, String base, Function<Path, Boolean> preprocessor, BiFunction<Path, Path, Boolean> processor, boolean defaultUnfoundRoot, boolean visitAllFiles)
+    public static boolean findFiles(ModContainer mod, String base, Function<Path, Boolean> preprocessor, BiFunction<Path, Path, Boolean> processor,
+            boolean defaultUnfoundRoot, boolean visitAllFiles)
     {
+
+        File source = mod.getSource();
+
+        if ("minecraft".equals(mod.getModId()))
+        {
+            if (!DEBUG_LOAD_MINECRAFT)
+                return true;
+
+            try
+            {
+                URI tmp = CraftingManager.class.getResource("/assets/.mcassetsroot").toURI();
+                source = new File(tmp.resolve("..").getPath());
+            }
+            catch (URISyntaxException e)
+            {
+                FMLLog.log.error("Error finding Minecraft jar: ", e);
+                return false;
+            }
+        }
+
         FileSystem fs = null;
+        boolean success = true;
+
         try
         {
-            File source = mod.getSource();
-
-            if ("minecraft".equals(mod.getModId()))
-            {
-                if (!DEBUG_LOAD_MINECRAFT)
-                    return true;
-
-                try
-                {
-                    URI tmp = CraftingManager.class.getResource("/assets/.mcassetsroot").toURI();
-                    source = new File(tmp.resolve("..").getPath());
-                }
-                catch (URISyntaxException e)
-                {
-                    FMLLog.log.error("Error finding Minecraft jar: ", e);
-                    return false;
-                }
-            }
-
             Path root = null;
+
             if (source.isFile())
             {
                 try
@@ -791,19 +804,17 @@ public class CraftingHelper {
             {
                 root = source.toPath().resolve(base);
             }
-
+    
             if (root == null || !Files.exists(root))
                 return defaultUnfoundRoot;
-
+    
             if (preprocessor != null)
             {
                 Boolean cont = preprocessor.apply(root);
                 if (cont == null || !cont.booleanValue())
                     return false;
             }
-
-            boolean success = true;
-
+        
             if (processor != null)
             {
                 Iterator<Path> itr = null;
@@ -816,11 +827,11 @@ public class CraftingHelper {
                     FMLLog.log.error("Error iterating filesystem for: {}", mod.getModId(), e);
                     return false;
                 }
-
+    
                 while (itr != null && itr.hasNext())
                 {
                     Boolean cont = processor.apply(root, itr.next());
-
+    
                     if (visitAllFiles)
                     {
                         success &= cont != null && cont;
@@ -831,12 +842,66 @@ public class CraftingHelper {
                     }
                 }
             }
-
-            return success;
         }
         finally
         {
             IOUtils.closeQuietly(fs);
+        }
+
+        return success;
+    }
+
+    public static JsonContext loadContext(ResourceLocation path) throws IOException
+    {
+        ModContainer mod = Loader.instance().activeModContainer();
+        if(mod == null)
+        {
+            throw new IllegalStateException("No active mod container");
+        }
+        return loadContext(path, mod);
+     }
+    
+    public static JsonContext loadContext(ResourceLocation path, ModContainer mod) throws IOException
+    {
+        return loadContext(mod, new JsonContext(mod.getModId()), path);
+    }
+
+    private static JsonContext loadContext(JsonContext ctx, File file) throws IOException
+    {
+        try(BufferedReader reader = new BufferedReader(new FileReader(file)))
+        {
+            JsonObject[] json = JsonUtils.fromJson(GSON, reader, JsonObject[].class);
+            ctx.loadConstants(json);
+            return ctx;
+        }
+        catch (IOException e)
+        {
+            throw new IOException("Error loading constants from file: " + file.getAbsolutePath(), e);
+        }
+    }
+
+    private static JsonContext loadContext(ModContainer mod, JsonContext ctx, ResourceLocation path) throws IOException
+    {
+        Path fPath = null;
+        if(mod.getSource().isFile())
+        {
+            try(FileSystem fs = FileSystems.newFileSystem(mod.getSource().toPath(), null))
+            {
+                fPath = fs.getPath("assets", path.getResourceDomain(), path.getResourcePath());
+            }
+        }
+        else if (mod.getSource().isDirectory())
+        {
+            fPath = mod.getSource().toPath().resolve(Paths.get("assets", path.getResourceDomain(), path.getResourcePath()));
+        }
+
+        if (fPath != null && Files.exists(fPath))
+        {
+            return loadContext(ctx, fPath.toFile());
+        } 
+        else 
+        {
+            throw new FileNotFoundException(fPath != null ? fPath.toString() : path.toString());
         }
     }
 }

@@ -81,6 +81,7 @@ import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.nbt.NBTTagList;
 import net.minecraft.network.NetHandlerPlayServer;
 import net.minecraft.network.Packet;
+import net.minecraft.network.datasync.DataSerializer;
 import net.minecraft.network.play.server.SPacketBlockChange;
 import net.minecraft.network.play.server.SPacketRecipeBook;
 import net.minecraft.network.play.server.SPacketRecipeBook.State;
@@ -93,6 +94,7 @@ import net.minecraft.util.DamageSource;
 import net.minecraft.util.EnumActionResult;
 import net.minecraft.util.EnumFacing;
 import net.minecraft.util.EnumHand;
+import net.minecraft.util.IntIdentityHashBiMap;
 import net.minecraft.util.JsonUtils;
 import net.minecraft.util.NonNullList;
 import net.minecraft.util.ResourceLocation;
@@ -115,6 +117,7 @@ import net.minecraft.world.storage.loot.LootTable;
 import net.minecraft.world.storage.loot.LootTableManager;
 import net.minecraft.world.storage.loot.conditions.LootCondition;
 import net.minecraftforge.common.crafting.CraftingHelper;
+import net.minecraftforge.common.crafting.JsonContext;
 import net.minecraftforge.common.util.BlockSnapshot;
 import net.minecraftforge.event.AnvilUpdateEvent;
 import net.minecraftforge.event.DifficultyChangeEvent;
@@ -146,11 +149,14 @@ import net.minecraftforge.fml.common.FMLLog;
 import net.minecraftforge.fml.common.Loader;
 import net.minecraftforge.fml.common.LoaderState;
 import net.minecraftforge.fml.common.ModContainer;
+import net.minecraftforge.fml.common.ObfuscationReflectionHelper;
 import net.minecraftforge.fml.common.eventhandler.Event;
 import net.minecraftforge.fml.common.network.handshake.NetworkDispatcher;
 import net.minecraftforge.fml.common.network.handshake.NetworkDispatcher.ConnectionType;
 import net.minecraftforge.fml.common.registry.ForgeRegistries;
-import net.minecraftforge.fml.relauncher.ReflectionHelper;
+import net.minecraftforge.registries.DataSerializerEntry;
+import net.minecraftforge.registries.ForgeRegistry;
+import net.minecraftforge.registries.GameData;
 import net.minecraftforge.registries.IForgeRegistry;
 import net.minecraftforge.registries.RegistryManager;
 
@@ -193,6 +199,15 @@ public class ForgeHooks
             return ItemStack.EMPTY;
         }
         return entry.getStack(rand, fortune);
+    }
+
+    public static boolean canContinueUsing(@Nonnull ItemStack from, @Nonnull ItemStack to)
+    {
+        if (!from.isEmpty() && !to.isEmpty())
+        {
+            return from.getItem().canContinueUsing(from, to);
+        }
+        return false;
     }
 
     private static boolean toolInit = false;
@@ -270,19 +285,19 @@ public class ForgeHooks
         }
         toolInit = true;
 
-        Set<Block> blocks = ReflectionHelper.getPrivateValue(ItemPickaxe.class, null, 0);
+        Set<Block> blocks = ObfuscationReflectionHelper.getPrivateValue(ItemPickaxe.class, null, "field_150915"+"_c");
         for (Block block : blocks)
         {
             block.setHarvestLevel("pickaxe", 0);
         }
 
-        blocks = ReflectionHelper.getPrivateValue(ItemSpade.class, null, 0);
+        blocks = ObfuscationReflectionHelper.getPrivateValue(ItemSpade.class, null, "field_150916"+"_c");
         for (Block block : blocks)
         {
             block.setHarvestLevel("shovel", 0);
         }
 
-        blocks = ReflectionHelper.getPrivateValue(ItemAxe.class, null, 0);
+        blocks = ObfuscationReflectionHelper.getPrivateValue(ItemAxe.class, null, "field_150917"+"_c");
         for (Block block : blocks)
         {
             block.setHarvestLevel("axe", 0);
@@ -330,7 +345,6 @@ public class ForgeHooks
                 return new ItemStack(Items.WHEAT_SEEDS, 1 + rand.nextInt(fortune * 2 + 1));
             }
         });
-        initTools();
     }
 
     /**
@@ -788,9 +802,8 @@ public class ForgeHooks
             link.getStyle().setUnderlined(true);
             link.getStyle().setColor(TextFormatting.BLUE);
             if (ichat == null)
-                ichat = link;
-            else
-                ichat.appendSibling(link);
+                ichat = new TextComponentString("");
+            ichat.appendSibling(link);
         }
 
         // Append the rest of the message.
@@ -1304,15 +1317,21 @@ public class ForgeHooks
 
     public static boolean loadAdvancements(Map<ResourceLocation, Advancement.Builder> map)
     {
+        CraftingHelper.init();
         boolean errored = false;
         setActiveModContainer(null);
-        //Loader.instance().getActiveModList().forEach((mod) -> loadFactories(mod));
+        Loader.instance().getActiveModList().forEach(ForgeHooks::loadFactories);
         for (ModContainer mod : Loader.instance().getActiveModList())
         {
             errored |= !loadAdvancements(map, mod);
         }
         setActiveModContainer(null);
         return errored;
+    }
+
+    private static void loadFactories(ModContainer mod)
+    {
+        CraftingHelper.loadFactories(mod, "assets/" + mod.getModId() + "/advancements", CraftingHelper.CONDITIONS);
     }
 
     @Nullable
@@ -1335,6 +1354,8 @@ public class ForgeHooks
 
     private static boolean loadAdvancements(Map<ResourceLocation, Advancement.Builder> map, ModContainer mod)
     {
+        JsonContext ctx = new JsonContext(mod.getModId());
+
         return CraftingHelper.findFiles(mod, "assets/" + mod.getModId() + "/advancements", null,
             (root, file) ->
             {
@@ -1353,7 +1374,11 @@ public class ForgeHooks
                     try
                     {
                         reader = Files.newBufferedReader(file);
-                        Advancement.Builder builder = JsonUtils.fromJson(AdvancementManager.GSON, reader, Advancement.Builder.class);
+                        String contents = IOUtils.toString(reader);
+                        JsonObject json = JsonUtils.gsonDeserialize(CraftingHelper.GSON, contents, JsonObject.class);
+                        if (!CraftingHelper.processConditions(json, "conditions", ctx))
+                            return true;
+                        Advancement.Builder builder = JsonUtils.gsonDeserialize(AdvancementManager.GSON, contents, Advancement.Builder.class);
                         map.put(key, builder);
                     }
                     catch (JsonParseException jsonparseexception)
@@ -1462,4 +1487,29 @@ public class ForgeHooks
         return false;
     }
 
+    private static final Map<DataSerializer<?>, DataSerializerEntry> serializerEntries = GameData.getSerializerMap();
+    private static final ForgeRegistry<DataSerializerEntry> serializerRegistry = (ForgeRegistry<DataSerializerEntry>) ForgeRegistries.DATA_SERIALIZERS;
+
+    @Nullable
+    public static DataSerializer<?> getSerializer(int id, IntIdentityHashBiMap<DataSerializer<?>> vanilla)
+    {
+        DataSerializer<?> serializer = vanilla.get(id);
+        if (serializer == null)
+        {
+            DataSerializerEntry entry = serializerRegistry.getValue(id);
+            if (entry != null) serializer = entry.getSerializer();
+        }
+        return serializer;
+    }
+
+    public static int getSerializerId(DataSerializer<?> serializer, IntIdentityHashBiMap<DataSerializer<?>> vanilla)
+    {
+        int id = vanilla.getId(serializer);
+        if (id < 0)
+        {
+            DataSerializerEntry entry = serializerEntries.get(serializer);
+            if (entry != null) id = serializerRegistry.getID(entry);
+        }
+        return id;
+    }
 }

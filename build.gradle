@@ -4,14 +4,18 @@ buildscript {
         mavenCentral()
         maven {
             name = "forge"
-            url = "http://files.minecraftforge.net/maven"
+            url = "https://files.minecraftforge.net/maven"
         }
         maven {
             name = "sonatype"
             url = "https://oss.sonatype.org/content/repositories/snapshots/"
         }
+        maven {
+            url "https://plugins.gradle.org/m2/"
+        }
     }
     dependencies {
+        classpath 'edu.sc.seis.launch4j:launch4j:2.4.6'
         classpath 'net.minecraftforge.gradle:ForgeGradle:2.3-SNAPSHOT'
     }
 }
@@ -22,7 +26,7 @@ plugins {
 
 apply plugin: "maven"
 def patcher_plugin = plugins.apply('net.minecraftforge.gradle.patcher')
-apply plugin: "net.minecraftforge.gradle.launch4j"
+apply plugin: 'edu.sc.seis.launch4j'
 
 minecraft.version = "1.12.2"
 
@@ -57,6 +61,20 @@ minecraft {
     }
 }
 
+ext {
+    //Dirty hack, but keeps our unique version system on new jenkins
+    BUILD_NUMBER = 2838 + (System.getenv('BUILD_NUMBER') ?: project.ext.properties.buildNumber ?: 0).toInteger()
+    
+    JAR_SIGNER = [:]
+    if (project.hasProperty('keystore')) {
+        JAR_SIGNER = [
+            storepass: project.properties.keystoreStorePass,
+            keypass: project.properties.keystoreKeyPass,
+            keystore: project.properties.keystore
+        ]
+    }
+}
+
 group = 'net.minecraftforge'
 version = getVersionFromJava(file("src/main/java/net/minecraftforge/common/ForgeVersion.java"))
 
@@ -88,6 +106,7 @@ license {
     header = project.file('LICENSE-header.txt')
 
     include 'net/minecraftforge/'
+    exclude 'net/minecraftforge/api/distmarker/'
     exclude 'net/minecraftforge/fml/repackage/'
     exclude 'net/minecraftforge/server/terminalconsole/'
     exclude 'net/minecraftforge/fml/common/versioning/ComparableVersion.java'
@@ -105,20 +124,20 @@ license {
     }
 }
 
-task changelog(type: JenkinsChangelog) {
-
-    // skip if there is no forge jenkins pass
-    onlyIf {
-        project.hasProperty('forgeJenkinsPass')
+task changelog() {
+    ext {
+        changelog_old = rootProject.file('legacy_changelog.txt')
+        changelog_new = rootProject.file('build/changelog_new.txt')
+        output = rootProject.file('build/changelog.txt')
     }
-
-    outputs.upToDateWhen { false } // never up to date
-    serverRoot = "http://ci.jenkins.minecraftforge.net/"
-    jobName = "minecraftforge"
-    targetBuild = System.env['BUILD_NUMBER'] ?: project.ext.properties.buildNumber ?:0;
-    authName = "console_script"
-    authPassword = project.hasProperty('forgeJenkinsPass') ? project.getProperty('forgeJenkinsPass') : "";
-    output = "build/distributions/${project.name}-${project.version}-changelog.txt"
+    inputs.file changelog_old
+    if (changelog_new.exists())
+        inputs.file changelog_new
+    outputs.file output
+    
+    doLast {
+        output.text = changelog_new.text + '\n' + changelog_old.text
+    }
 }
 
 task crowdin(type: CrowdinDownload) {
@@ -135,10 +154,9 @@ def extraTxts = [
     "CREDITS.txt",
     "LICENSE.txt",
     "LICENSE-Paulscode SoundSystem CodecIBXM.txt",
-    "LICENSE-Paulscode IBXM Library.txt"
+    "LICENSE-Paulscode IBXM Library.txt",
+    changelog
 ]
-if (project.hasProperty('forgeJenkinsPass'))
-    extraTxts += changelog
 
 import groovy.json.JsonSlurper;
 import groovy.json.JsonBuilder;
@@ -224,16 +242,11 @@ task signUniversal(type: SignJar, dependsOn: 'outputJar') {
         project.hasProperty('jarsigner')
     }
 
-    def jarsigner = [:];
-
-    if (project.hasProperty('jarsigner'))
-        jarsigner = project.jarsigner;
-
     alias = 'forge'
     exclude "paulscode/**"
-    storePass = jarsigner.storepass
-    keyPass = jarsigner.keypass
-    keyStore = jarsigner.keystore
+    storePass = JAR_SIGNER.storepass
+    keyPass = JAR_SIGNER.keypass
+    keyStore = JAR_SIGNER.keystore
     inputFile = outputJar.archivePath
     outputFile = outputJar.archivePath
 }
@@ -274,34 +287,34 @@ tasks.build.dependsOn makeMdk
 
 launch4j {
     jar = installer.archivePath.canonicalPath
-    outfile = file("build/distributions/${project.name}-${project.version}-installer-win.exe").canonicalPath
+    outfile = "${project.name}-${project.version}-installer-win.exe"
     icon = file('icon.ico').canonicalPath
     manifest = file('l4jManifest.xml').canonicalPath
-    jreMinVersion = '1.8.0'
-    initialHeapPercent = 5;
-    maxHeapPercent = 100;
+    jreMinVersion = '1.8.0_101'
+    initialHeapPercent = 5
+    maxHeapPercent = 100
 }
-tasks.generateXmlConfig.dependsOn installer
+tasks.createExe.dependsOn installer
 tasks.build.dependsOn 'launch4j'
 
 // MAVEN
 
 artifacts {
-    if (project.hasProperty('forgeJenkinsPass'))
-        archives changelog.output
-    archives file("build/distributions/${project.name}-${project.version}-installer-win.exe")
+    archives(changelog.outputs.files.singleFile) {
+        classifier = 'changelog'
+    }
+    archives file('build/' + launch4j.outputDir + '/' + launch4j.outfile)
     archives makeMdk
 }
 
 task ciWriteBuildNumber << {
     def file = file("src/main/java/net/minecraftforge/common/ForgeVersion.java");
-    def bn = System.getenv("BUILD_NUMBER")?:project.ext.properties.buildNumber?:0;
     def outfile = "";
     def ln = "\n"; //Linux line endings because we're on git!
 
     file.eachLine{ String s ->
         if (s.matches("^    public static final int buildVersion    = [\\d]+;\$"))
-            s = "    public static final int buildVersion    = ${bn};";
+            s = "    public static final int buildVersion    = ${BUILD_NUMBER};";
         if (s.matches('^    public static final String mcVersion = "[^\\"]+";'))
             s = "    public static final String mcVersion = \"${minecraft.version}\";";
         outfile += (s+ln);
@@ -314,15 +327,14 @@ uploadArchives {
 
         dependsOn 'build'
 
-        if (project.hasProperty('forgeMavenPass'))
+        if (project.hasProperty('forgeMavenPassword'))
         {
-            repository(url: "http://files.minecraftforge.net/maven/manage/upload") {
-                authentication(userName: "forge", password: project.getProperty('forgeMavenPass')) // the elvis operator. look it up.
+            repository(url: "https://files.minecraftforge.net/maven/manage/upload") {
+                authentication(userName: project.getProperty('forgeMavenUser'), password: project.getProperty('forgeMavenPassword'))
             }
         }
         else
         {
-            // local repo folder. Might wanna juset use  gradle install   if you wanans end it to maven-local
             repository(url: 'file://localhost/' + project.file('repo').getAbsolutePath())
         }
 
@@ -422,8 +434,7 @@ String getVersionFromJava(File file)
         }
     }
 
-    build = System.getenv("BUILD_NUMBER") ?: project.ext.properties.buildNumber ?: 0
-
+    build = BUILD_NUMBER
 
     String branch = null;
     if (!System.getenv().containsKey("GIT_BRANCH"))
